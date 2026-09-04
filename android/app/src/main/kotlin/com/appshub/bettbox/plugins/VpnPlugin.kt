@@ -12,6 +12,7 @@ import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
 import android.service.quicksettings.TileService
+import android.widget.Toast
 import androidx.core.content.getSystemService
 import com.appshub.bettbox.BettboxApplication
 import com.appshub.bettbox.GlobalState
@@ -515,6 +516,17 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }
     }
 
+    fun setHighPriorityNotification(enabled: Boolean) {
+        GlobalState.isNotificationHighPriority = enabled
+        (bettBoxService as? BettboxService)?.resetNotificationBuilder()
+        (bettBoxService as? BettboxVpnService)?.resetNotificationBuilder()
+        if (GlobalState.currentRunState == RunState.START) {
+            scope.launch {
+                startForeground()
+            }
+        }
+    }
+
     fun getStatus(): Boolean {
         return GlobalState.runLock.withLock {
             GlobalState.currentRunState == RunState.START && bettBoxService != null
@@ -742,9 +754,17 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         suspendModule = null
         Core.stopTun()
         Core.suspended(true)
+        (bettBoxService as? BettboxService)?.resetNotificationBuilder()
+        (bettBoxService as? BettboxVpnService)?.resetNotificationBuilder()
         scope.launch {
             startForeground()
         }
+        scope.launch(Dispatchers.Main) {
+            Toast.makeText(BettboxApplication.getAppContext(), "Bettbox Suspended", Toast.LENGTH_SHORT).show()
+        }
+        // Without this, the UI/tile icon keeps showing the "running" state even
+        // though RunState/isSmartStopped already flipped underneath it.
+        ServicePlugin.notifyNetworkChanged()
     }
 
     fun handleSmartResume(options: VpnOptions): Boolean {
@@ -753,6 +773,16 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 if (GlobalState.currentRunState == RunState.START) return@withLock false
                 GlobalState.isSmartStopped = false
                 this@VpnPlugin.options = options
+                // Core.suspended is independent of the service-binding state, so clear it
+                // unconditionally here. Previously this was only called after this withLock
+                // block on the "already bound" path; if bettBoxService was null (service was
+                // killed/unbound while smart-stopped, e.g. by the OS or a swiped-away task),
+                // this returned early via bindService() below and Core.suspended(false) was
+                // never called. Core.startTun() would run later via the rebind ->
+                // handleStartService() chain, but Core itself stayed marked "suspended", so
+                // resume could silently fail to actually pass traffic even though the run
+                // state/notification looked normal.
+                Core.suspended(false)
 
                 if (bettBoxService == null) {
                     bindService()
@@ -765,8 +795,15 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             }
             if (!startAllowed) return@launch
 
-            Core.suspended(false)
+            (bettBoxService as? BettboxService)?.resetNotificationBuilder()
+            (bettBoxService as? BettboxVpnService)?.resetNotificationBuilder()
             performStartCore(options, retry = false, notifyOnFailure = false)
+            withContext(Dispatchers.Main) {
+                Toast.makeText(BettboxApplication.getAppContext(), "Bettbox Connected", Toast.LENGTH_SHORT).show()
+            }
+            // Without this, the UI/tile icon keeps showing the "suspended" state even
+            // though RunState/isSmartStopped already flipped underneath it.
+            ServicePlugin.notifyNetworkChanged()
         }
         return true
     }
