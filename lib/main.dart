@@ -167,11 +167,39 @@ Future<void> _service(List<String> flags) async {
       });
     }
 
+    // Runs an initial smart-auto-stop evaluation right after the VPN starts,
+    // retrying every second for up to 8 seconds. This is needed because a
+    // fresh start has no *network change* event to trigger
+    // _debouncedCheckSmartAutoStop - without this, a start that happens while
+    // already sitting on a "should stop" network (e.g. tapping the tile at
+    // home) would never be evaluated until some later, unrelated network
+    // transition occurred. Previously this was only scheduled inside the
+    // boot/quick-start flow below, so a manual/tile start (no boot/quick
+    // flag, e.g. after reboot with autoRun off, or a normal tap) skipped it
+    // entirely.
+    void _scheduleInitialSmartAutoStopCheck() {
+      Future(() async {
+        final vpnProps = globalState.config.vpnProps;
+        if (!vpnProps.smartAutoStop) return;
+        final networks = vpnProps.smartAutoStopNetworks;
+        if (networks.isEmpty) return;
+        for (int attempt = 0; attempt < 8; attempt++) {
+          await Future.delayed(const Duration(seconds: 1));
+          await checkSmartAutoStop();
+          final isSmartStopped = await vpn?.isSmartStopped() ?? false;
+          final isRunning = await vpn?.getStatus() ?? false;
+          if (!isRunning) return;
+          if (isSmartStopped) return;
+        }
+      });
+    }
+
     tile?.addListener(
       _TileListenerWithService(
         onStart: () async {
           await app.tip(appLocalizations.startVpn);
           await globalState.handleStart();
+          _scheduleInitialSmartAutoStopCheck();
         },
         onStop: () async {
           await app.tip(appLocalizations.stopVpn);
@@ -239,22 +267,9 @@ Future<void> _service(List<String> flags) async {
           return;
         }
         await vpn?.start(clashLibHandler.getAndroidVpnOptions());
-        // Smart auto-stop: retry every 1 second, up to 8 attempts (8 seconds window)
         // Combined with onAvailable/onLost callbacks for immediate response
-        Future(() async {
-          final vpnProps = globalState.config.vpnProps;
-          if (!vpnProps.smartAutoStop) return;
-          final networks = vpnProps.smartAutoStopNetworks;
-          if (networks.isEmpty) return;
-          for (int attempt = 0; attempt < 8; attempt++) {
-            await Future.delayed(const Duration(seconds: 1));
-            await checkSmartAutoStop();
-            final isSmartStopped = await vpn?.isSmartStopped() ?? false;
-            final isRunning = await vpn?.getStatus() ?? false;
-            if (!isRunning) return;
-            if (isSmartStopped) return;
-          }
-        });
+        // on later real network transitions.
+        _scheduleInitialSmartAutoStopCheck();
 
         if (globalState.config.vpnProps.networkSpeedNotification) {
           final profile = globalState.config.profiles
