@@ -12,7 +12,6 @@ import android.net.NetworkRequest
 import android.os.Build
 import android.os.IBinder
 import android.service.quicksettings.TileService
-import android.widget.Toast
 import androidx.core.content.getSystemService
 import com.appshub.bettbox.BettboxApplication
 import com.appshub.bettbox.GlobalState
@@ -190,6 +189,10 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 result.success(getLocalIpAddresses())
             }
 
+            "getLocalGateways" -> {
+                result.success(getLocalGateways())
+            }
+
             "setSmartStopped" -> {
                 val value = call.argument<Boolean>("value") ?: false
                 GlobalState.isSmartStopped = value
@@ -209,7 +212,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
                 val data = call.argument<String>("data")
                 result.success(handleSmartResume(Gson().fromJson(data, VpnOptions::class.java)))
             }
-            
+
             "setQuickResponse" -> {
                 quickResponseEnabled = call.argument<Boolean>("enabled") ?: false
                 result.success(true)
@@ -232,13 +235,41 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             }
         }
     }
-    
+
     fun setQuickResponse(enabled: Boolean) {
         quickResponseEnabled = enabled
     }
 
+    /**
+     * Returns non-VPN networks with three-layer fallback:
+     * 1. Networks collected by NetworkCallback
+     * 2. All non-VPN networks from ConnectivityManager
+     * 3. Active network directly (covers cold boot where callbacks haven't fired)
+     */
+    private fun getNonVpnNetworks(): Set<Network> {
+        val callbackNetworks = networks.ifEmpty {
+            connectivity?.allNetworks?.filter { network ->
+                val caps = connectivity?.getNetworkCapabilities(network)
+                caps != null && !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+            }?.toSet() ?: emptySet()
+        }
+
+        if (callbackNetworks.isNotEmpty()) return callbackNetworks
+
+        // Layer 3: direct fallback to active network (covers cold boot case
+        // where NetworkCallback and allNetworks haven't fired yet)
+        return connectivity?.activeNetwork?.let { active ->
+            val caps = connectivity?.getNetworkCapabilities(active)
+            if (caps == null || !caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
+                setOf(active)
+            } else {
+                emptySet()
+            }
+        } ?: emptySet()
+    }
+
     fun getLocalIpAddresses(): List<String> = runCatching {
-        networks.flatMap { network ->
+        getNonVpnNetworks().flatMap { network ->
             connectivity?.getLinkProperties(network)
                 ?.linkAddresses
                 ?.mapNotNull { it.address }
@@ -252,7 +283,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
     }
 
     fun getLocalGateways(): List<String> = runCatching {
-        networks.flatMap { network ->
+        getNonVpnNetworks().flatMap { network ->
             connectivity?.getLinkProperties(network)
                 ?.routes
                 ?.filter { it.isDefaultRoute() }
@@ -332,6 +363,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         override fun onAvailable(network: Network) {
             networks.add(network)
             handleNetworkChange()
+            invokeDart("networkChanged")
         }
 
         override fun onLost(network: Network) {
@@ -339,6 +371,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             networkDnsMap.remove(network)
             onUpdateNetwork()
             handleNetworkChange()
+            invokeDart("networkChanged")
         }
 
         override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
@@ -377,7 +410,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             onUpdateNetwork()
         }
     }
-    
+
     private fun handleNetworkChange() {
         val currentNetworkType = getCurrentNetworkType()
         if (lastNetworkType == null) {
@@ -417,7 +450,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             }
         }
     }
-    
+
     private fun getCurrentNetworkType(): Int {
         val activeNetwork = connectivity?.activeNetwork ?: return -1
         val caps = connectivity?.getNetworkCapabilities(activeNetwork) ?: return -1
@@ -482,17 +515,6 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         }
     }
 
-    fun setHighPriorityNotification(enabled: Boolean) {
-        GlobalState.isNotificationHighPriority = enabled
-        (bettBoxService as? BettboxService)?.resetNotificationBuilder()
-        (bettBoxService as? BettboxVpnService)?.resetNotificationBuilder()
-        if (GlobalState.currentRunState == RunState.START) {
-            scope.launch {
-                startForeground()
-            }
-        }
-    }
-
     fun getStatus(): Boolean {
         return GlobalState.runLock.withLock {
             GlobalState.currentRunState == RunState.START && bettBoxService != null
@@ -508,7 +530,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             bindService()
             return
         }
-        
+
         scope.launch {
             try {
                 val prepareIntent = try {
@@ -623,9 +645,9 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             val success = runCatching {
                 (bettBoxService as? BettboxVpnService)?.protect(fd) == true
             }.getOrDefault(false)
-            
+
             if (success) return true
-            
+
             retries++
             if (retries < 5) {
                 Thread.sleep(60)
@@ -720,15 +742,9 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
         suspendModule = null
         Core.stopTun()
         Core.suspended(true)
-        (bettBoxService as? BettboxService)?.resetNotificationBuilder()
-        (bettBoxService as? BettboxVpnService)?.resetNotificationBuilder()
         scope.launch {
             startForeground()
         }
-        scope.launch(Dispatchers.Main) {
-            Toast.makeText(BettboxApplication.getAppContext(), "Bettbox Suspended", Toast.LENGTH_SHORT).show()
-        }
-        ServicePlugin.notifyNetworkChanged()
     }
 
     fun handleSmartResume(options: VpnOptions): Boolean {
@@ -750,13 +766,7 @@ data object VpnPlugin : FlutterPlugin, MethodChannel.MethodCallHandler {
             if (!startAllowed) return@launch
 
             Core.suspended(false)
-            (bettBoxService as? BettboxService)?.resetNotificationBuilder()
-            (bettBoxService as? BettboxVpnService)?.resetNotificationBuilder()
             performStartCore(options, retry = false, notifyOnFailure = false)
-            withContext(Dispatchers.Main) {
-                Toast.makeText(BettboxApplication.getAppContext(), "Bettbox Connected", Toast.LENGTH_SHORT).show()
-            }
-            ServicePlugin.notifyNetworkChanged()
         }
         return true
     }
