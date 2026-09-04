@@ -154,6 +154,19 @@ Future<void> _service(List<String> flags) async {
       }
     }
 
+    // Debounced version for network change events
+    // Shorter delay (500ms) for faster response
+    int _networkChangeCheckSequence = 0;
+    void _debouncedCheckSmartAutoStop() {
+      final currentSequence = ++_networkChangeCheckSequence;
+      Future.delayed(const Duration(milliseconds: 600), () async {
+        if (currentSequence != _networkChangeCheckSequence) {
+          return;
+        }
+        await checkSmartAutoStop();
+      });
+    }
+
     tile?.addListener(
       _TileListenerWithService(
         onStart: () async {
@@ -179,7 +192,7 @@ Future<void> _service(List<String> flags) async {
         onDnsChanged: (String dns) {
           clashLibHandler.updateDns(dns);
         },
-        onNetworkChanged: checkSmartAutoStop,
+        onNetworkChanged: _debouncedCheckSmartAutoStop,
       ),
     );
 
@@ -226,7 +239,22 @@ Future<void> _service(List<String> flags) async {
           return;
         }
         await vpn?.start(clashLibHandler.getAndroidVpnOptions());
-        Future.delayed(const Duration(seconds: 2), checkSmartAutoStop);
+        // Smart auto-stop: retry every 1 second, up to 8 attempts (8 seconds window)
+        // Combined with onAvailable/onLost callbacks for immediate response
+        Future(() async {
+          final vpnProps = globalState.config.vpnProps;
+          if (!vpnProps.smartAutoStop) return;
+          final networks = vpnProps.smartAutoStopNetworks;
+          if (networks.isEmpty) return;
+          for (int attempt = 0; attempt < 8; attempt++) {
+            await Future.delayed(const Duration(seconds: 1));
+            await checkSmartAutoStop();
+            final isSmartStopped = await vpn?.isSmartStopped() ?? false;
+            final isRunning = await vpn?.getStatus() ?? false;
+            if (!isRunning) return;
+            if (isSmartStopped) return;
+          }
+        });
 
         if (globalState.config.vpnProps.networkSpeedNotification) {
           final profile = globalState.config.profiles
