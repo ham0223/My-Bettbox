@@ -211,11 +211,11 @@ Future<void> _service(List<String> flags) async {
     }
 
     // Debounced version for network change events
-    // Shorter delay (500ms) for faster response
+    // Shorter delay (1200ms) for faster response
     int _networkChangeCheckSequence = 0;
     void _debouncedCheckSmartAutoStop() {
       final currentSequence = ++_networkChangeCheckSequence;
-      Future.delayed(const Duration(milliseconds: 600), () async {
+      Future.delayed(const Duration(milliseconds: 1200), () async {
         if (currentSequence != _networkChangeCheckSequence) {
           return;
         }
