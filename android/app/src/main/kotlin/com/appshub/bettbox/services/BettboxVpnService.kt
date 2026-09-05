@@ -253,6 +253,27 @@ class BettboxVpnService : VpnService(), BaseServiceInterface {
             return
         }
 
+        // Running <-> smart-suspended toggles the foreground service type
+        // (FOREGROUND_SERVICE_TYPE_SPECIAL_USE <-> none) and notification
+        // channel. Re-declaring startForeground() in place (without detaching
+        // first) is usually fine, but on some Android 12+/OEM builds the
+        // status-bar icon can fail to repaint after this kind of type change,
+        // especially if the screen has been off / device was in Doze for a
+        // while - the underlying state is correct, only the status-bar
+        // rendering is stale (pulling down the notification shade forces a
+        // repaint and "fixes" it, which is the telltale sign of this issue).
+        // Detaching first forces every transition to be treated as a fresh
+        // foreground declaration instead of an in-place type change.
+        // Only done past the speed-notification early-return above, since
+        // that path (when not the very first call) only calls notify()
+        // afterwards and would leave the service permanently detached from
+        // its foreground state if we detached here first.
+        if (!isFirstTime) {
+            runCatching {
+                stopForeground(STOP_FOREGROUND_DETACH)
+            }.onFailure { Log.e(TAG, "stopForeground(DETACH) before re-declare failed: ${it.message}") }
+        }
+
         this.startForeground(notification, useSpecialType = !isSuspended)
     }
 
