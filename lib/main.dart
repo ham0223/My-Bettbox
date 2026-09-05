@@ -115,46 +115,6 @@ Future<void> _service(List<String> flags) async {
     final clashLibHandler = ClashLibHandler();
     final smartAutoStopLock = Lock();
 
-    Future<void> checkSmartAutoStop() async {
-      try {
-        final vpnProps = globalState.config.vpnProps;
-        if (!vpnProps.smartAutoStop) return;
-        final networks = vpnProps.smartAutoStopNetworks;
-        if (networks.isEmpty) return;
-
-        await smartAutoStopLock.synchronized(() async {
-          final isSmartStopped = await vpn?.isSmartStopped() ?? false;
-          final candidateIps =
-              await vpn?.getLocalIpAddresses() ?? const <String>[];
-          final candidateGateways =
-              await vpn?.getLocalGateways() ?? const <String>[];
-          if (candidateIps.isEmpty && candidateGateways.isEmpty) return;
-
-          final shouldStop =
-              candidateIps.any(
-                (ip) => NetworkMatcher.matchAny(ip, networks),
-              ) ||
-              candidateGateways.any(
-                (gw) => NetworkMatcher.matchAnyGateway(gw, networks),
-              );
-
-          if (shouldStop && !isSmartStopped) {
-            final isRunning = await vpn?.getStatus() ?? false;
-            if (isRunning) {
-              await vpn?.setSmartStopped(true);
-              await vpn?.smartStop();
-            }
-          } else if (!shouldStop && isSmartStopped) {
-            await vpn?.setSmartStopped(false);
-            await vpn?.smartResume(clashLibHandler.getAndroidVpnOptions());
-            _verifySmartResume(networks);
-          }
-        });
-      } catch (e) {
-        commonPrint.log('Smart auto stop check failed: $e');
-      }
-    }
-
     // smartResume() on the native side kicks off the actual rebind/restart
     // work in a fire-and-forget coroutine and returns immediately, so a
     // successful call here does NOT mean the tunnel is actually back up yet.
@@ -166,6 +126,10 @@ Future<void> _service(List<String> flags) async {
     // and retries a few times if not, instead of leaving the VPN silently
     // down. Runs outside smartAutoStopLock so it never blocks a real,
     // subsequent network-change decision.
+    //
+    // Declared before checkSmartAutoStop() below because Dart local
+    // functions (unlike top-level ones) can't be referenced before their
+    // declaration in the same scope.
     bool _smartResumeVerifyRunning = false;
     void _verifySmartResume(List<String> networks) {
       if (_smartResumeVerifyRunning) return;
@@ -204,6 +168,46 @@ Future<void> _service(List<String> flags) async {
           _smartResumeVerifyRunning = false;
         }
       });
+    }
+
+    Future<void> checkSmartAutoStop() async {
+      try {
+        final vpnProps = globalState.config.vpnProps;
+        if (!vpnProps.smartAutoStop) return;
+        final networks = vpnProps.smartAutoStopNetworks;
+        if (networks.isEmpty) return;
+
+        await smartAutoStopLock.synchronized(() async {
+          final isSmartStopped = await vpn?.isSmartStopped() ?? false;
+          final candidateIps =
+              await vpn?.getLocalIpAddresses() ?? const <String>[];
+          final candidateGateways =
+              await vpn?.getLocalGateways() ?? const <String>[];
+          if (candidateIps.isEmpty && candidateGateways.isEmpty) return;
+
+          final shouldStop =
+              candidateIps.any(
+                (ip) => NetworkMatcher.matchAny(ip, networks),
+              ) ||
+              candidateGateways.any(
+                (gw) => NetworkMatcher.matchAnyGateway(gw, networks),
+              );
+
+          if (shouldStop && !isSmartStopped) {
+            final isRunning = await vpn?.getStatus() ?? false;
+            if (isRunning) {
+              await vpn?.setSmartStopped(true);
+              await vpn?.smartStop();
+            }
+          } else if (!shouldStop && isSmartStopped) {
+            await vpn?.setSmartStopped(false);
+            await vpn?.smartResume(clashLibHandler.getAndroidVpnOptions());
+            _verifySmartResume(networks);
+          }
+        });
+      } catch (e) {
+        commonPrint.log('Smart auto stop check failed: $e');
+      }
     }
 
     // Debounced version for network change events
