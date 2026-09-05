@@ -131,7 +131,7 @@ Future<void> _service(List<String> flags) async {
     // functions (unlike top-level ones) can't be referenced before their
     // declaration in the same scope.
     bool _smartResumeVerifyRunning = false;
-    void _verifySmartResume(List<String> networks) {
+    void _verifySmartResume(String networks) {
       if (_smartResumeVerifyRunning) return;
       _smartResumeVerifyRunning = true;
       Future(() async {
