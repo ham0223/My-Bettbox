@@ -147,11 +147,63 @@ Future<void> _service(List<String> flags) async {
           } else if (!shouldStop && isSmartStopped) {
             await vpn?.setSmartStopped(false);
             await vpn?.smartResume(clashLibHandler.getAndroidVpnOptions());
+            _verifySmartResume(networks);
           }
         });
       } catch (e) {
         commonPrint.log('Smart auto stop check failed: $e');
       }
+    }
+
+    // smartResume() on the native side kicks off the actual rebind/restart
+    // work in a fire-and-forget coroutine and returns immediately, so a
+    // successful call here does NOT mean the tunnel is actually back up yet.
+    // If the native bindService() call stalls or times out (observed in
+    // practice after the device has been idle/Doze for a while - low
+    // probability, but real), nothing else would normally re-attempt it until
+    // some unrelated later network event happens to trigger another check.
+    // This verifies the resume actually took effect within a bounded window
+    // and retries a few times if not, instead of leaving the VPN silently
+    // down. Runs outside smartAutoStopLock so it never blocks a real,
+    // subsequent network-change decision.
+    bool _smartResumeVerifyRunning = false;
+    void _verifySmartResume(List<String> networks) {
+      if (_smartResumeVerifyRunning) return;
+      _smartResumeVerifyRunning = true;
+      Future(() async {
+        try {
+          for (int attempt = 0; attempt < 6; attempt++) {
+            await Future.delayed(const Duration(seconds: 2));
+            final stillSmartStopped = await vpn?.isSmartStopped() ?? false;
+            final isRunning = await vpn?.getStatus() ?? false;
+            if (!stillSmartStopped && isRunning) return;
+
+            // Make sure the decision to resume still holds before retrying -
+            // if the user moved back onto a "should stop" network meanwhile,
+            // don't fight that.
+            final candidateIps =
+                await vpn?.getLocalIpAddresses() ?? const <String>[];
+            final candidateGateways =
+                await vpn?.getLocalGateways() ?? const <String>[];
+            final shouldStopNow =
+                candidateIps.any(
+                  (ip) => NetworkMatcher.matchAny(ip, networks),
+                ) ||
+                candidateGateways.any(
+                  (gw) => NetworkMatcher.matchAnyGateway(gw, networks),
+                );
+            if (shouldStopNow) return;
+
+            commonPrint.log(
+              'Smart resume has not taken effect yet, retrying (attempt ${attempt + 1})',
+            );
+            await vpn?.setSmartStopped(false);
+            await vpn?.smartResume(clashLibHandler.getAndroidVpnOptions());
+          }
+        } finally {
+          _smartResumeVerifyRunning = false;
+        }
+      });
     }
 
     // Debounced version for network change events
@@ -177,19 +229,39 @@ Future<void> _service(List<String> flags) async {
     // boot/quick-start flow below, so a manual/tile start (no boot/quick
     // flag, e.g. after reboot with autoRun off, or a normal tap) skipped it
     // entirely.
+    //
+    // Guarded against overlap: if a tile tap and the boot/quick flow happen to
+    // race (e.g. user taps the tile right as autoRun is kicking in), only one
+    // 8-second polling loop runs; the second call is a no-op. checkSmartAutoStop
+    // itself is still safe to call concurrently (serialized by
+    // smartAutoStopLock), this guard just avoids doubling up the polling work.
+    bool _initialSmartAutoStopCheckRunning = false;
     void _scheduleInitialSmartAutoStopCheck() {
+      if (_initialSmartAutoStopCheckRunning) return;
       Future(() async {
         final vpnProps = globalState.config.vpnProps;
         if (!vpnProps.smartAutoStop) return;
         final networks = vpnProps.smartAutoStopNetworks;
         if (networks.isEmpty) return;
-        for (int attempt = 0; attempt < 8; attempt++) {
-          await Future.delayed(const Duration(seconds: 1));
-          await checkSmartAutoStop();
-          final isSmartStopped = await vpn?.isSmartStopped() ?? false;
-          final isRunning = await vpn?.getStatus() ?? false;
-          if (!isRunning) return;
-          if (isSmartStopped) return;
+        _initialSmartAutoStopCheckRunning = true;
+        try {
+          for (int attempt = 0; attempt < 8; attempt++) {
+            await Future.delayed(const Duration(seconds: 1));
+            // Re-read on every attempt: bail out early if the user disabled
+            // smart auto-stop, or if it no longer has any networks configured,
+            // while this loop was still running.
+            final props = globalState.config.vpnProps;
+            if (!props.smartAutoStop || props.smartAutoStopNetworks.isEmpty) {
+              return;
+            }
+            await checkSmartAutoStop();
+            final isSmartStopped = await vpn?.isSmartStopped() ?? false;
+            final isRunning = await vpn?.getStatus() ?? false;
+            if (!isRunning) return;
+            if (isSmartStopped) return;
+          }
+        } finally {
+          _initialSmartAutoStopCheckRunning = false;
         }
       });
     }
